@@ -1,4 +1,4 @@
-const { getStreams } = require("./providers/pelisplushd.js");
+const { getStreams } = require("./providers/latanime.js");
 
 (async () => {
 
