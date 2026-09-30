@@ -2,7 +2,7 @@ import { getMovie, getTv } from "./tmdb.js";
 import { searchLatanime } from "./search.js";
 import { getEpisodeUrl } from "./series.js";
 import { fetchText } from "./http.js";
-import { getResolver } from "./resolvers/index.js";
+import { getResolver, sourceRank } from "./resolvers/index.js";
 
 import cheerio from "cheerio-without-node-native";
 
@@ -71,7 +71,7 @@ export async function extractStreams(
             mediaType === "tv"
                 ? season
                 : null
-        );
+        ).filter(Boolean);
 
     if (
         selectedResults.length === 0
@@ -92,10 +92,6 @@ export async function extractStreams(
         const selected of selectedResults
     ) {
 
-        if (!selected) {
-            continue;
-        }
-
         console.log(
             `[Latanime] Selected: ${selected.title}`
         );
@@ -109,272 +105,373 @@ export async function extractStreams(
         );
     }
 
+    if (
+        mediaType === "tv" &&
+        (
+            !Number.isInteger(Number(season)) ||
+            !Number.isInteger(Number(episode))
+        )
+    ) {
+
+        throw new Error(
+            "[Latanime] A TV request requires season and episode numbers."
+        );
+    }
+
     // ==================================================
-    // PROCESS ALL SELECTED LANGUAGE VARIANTS
+    // PROCESS ALL LANGUAGE VARIANTS (EN PARALELO)
+    // ==================================================
+    // Cada variante de idioma (latino, castellano, sub) se procesa
+    // al mismo tiempo; dentro de cada una, los servidores también
+    // se resuelven en paralelo. Una variante o un servidor que falle
+    // no afecta a los demás.
+
+    const processedEpisodeUrls =
+        new Set();
+
+    const perVariant =
+        await Promise.all(
+            selectedResults.map(
+                selected =>
+                    processVariant(
+                        selected,
+                        mediaType,
+                        season,
+                        episode,
+                        processedEpisodeUrls
+                    ).catch(
+                        error => {
+
+                            console.warn(
+                                `[Latanime] Variant failed (${selected.language || "unknown"}): ${error.message}`
+                            );
+
+                            return [];
+                        }
+                    )
+            )
+        );
+
+    // ==================================================
+    // DEDUPLICATE + ORDER
     // ==================================================
 
     const streams =
         [];
 
-    const processedEpisodeUrls =
+    const seenStreams =
         new Set();
 
     for (
-        const selected of selectedResults
+        const stream of perVariant.flat()
     ) {
 
-        if (!selected) {
-            continue;
-        }
-
-        // ==============================================
-        // EPISODE
-        // ==============================================
-
-        let episodeUrl =
-            selected.url;
+        const key =
+            `${stream.url}|${stream.quality}`;
 
         if (
-            mediaType === "tv"
-        ) {
-
-            if (
-                !Number.isInteger(
-                    Number(season)
-                ) ||
-                !Number.isInteger(
-                    Number(episode)
-                )
-            ) {
-
-                throw new Error(
-                    "[Latanime] A TV request requires season and episode numbers."
-                );
-            }
-
-            episodeUrl =
-                await getEpisodeUrl(
-                    selected.url,
-                    season,
-                    episode
-                );
-
-            if (
-                !episodeUrl
-            ) {
-
-                console.warn(
-                    `[Latanime] Episode S${season}E${episode} not found for ${selected.language || "unknown"}`
-                );
-
-                continue;
-            }
-
-            console.log(
-                `[Latanime] ${languageLabel(selected.language)} episode URL: ${episodeUrl}`
-            );
-        }
-
-        // ==============================================
-        // DEDUPLICATE EPISODE
-        // ==============================================
-
-        const episodeKey =
-            `${selected.language || "unknown"}|${episodeUrl}`;
-
-        if (
-            processedEpisodeUrls.has(
-                episodeKey
+            seenStreams.has(
+                key
             )
         ) {
 
             continue;
         }
 
-        processedEpisodeUrls.add(
+        seenStreams.add(
+            key
+        );
+
+        streams.push(
+            stream
+        );
+    }
+
+    // Orden final: primero por servidor (según SOURCE_ORDER) y, dentro
+    // de cada servidor, se conserva el orden de idiomas de la selección.
+    const ordered =
+        streams
+            .map(
+                (stream, index) => ({
+                    stream,
+                    index,
+                    rank:
+                        sourceRank(
+                            stream.serverName
+                        )
+                })
+            )
+            .sort(
+                (a, b) =>
+                    a.rank - b.rank ||
+                    a.index - b.index
+            )
+            .map(
+                item => {
+
+                    const { serverName, ...stream } =
+                        item.stream;
+
+                    return stream;
+                }
+            );
+
+    console.log(
+        `[Latanime] Final streams: ${ordered.length}`
+    );
+
+    return ordered;
+}
+
+
+// ======================================================
+// PROCESS ONE LANGUAGE VARIANT
+// ======================================================
+
+async function processVariant(
+    selected,
+    mediaType,
+    season,
+    episode,
+    processedEpisodeUrls
+) {
+
+    // ==============================================
+    // EPISODE
+    // ==============================================
+
+    let episodeUrl =
+        selected.url;
+
+    if (
+        mediaType === "tv"
+    ) {
+
+        episodeUrl =
+            await getEpisodeUrl(
+                selected.url,
+                season,
+                episode
+            );
+
+        if (
+            !episodeUrl
+        ) {
+
+            console.warn(
+                `[Latanime] Episode S${season}E${episode} not found for ${selected.language || "unknown"}`
+            );
+
+            return [];
+        }
+
+        console.log(
+            `[Latanime] ${languageLabel(selected.language)} episode URL: ${episodeUrl}`
+        );
+    }
+
+    // ==============================================
+    // DEDUPLICATE EPISODE
+    // ==============================================
+
+    const episodeKey =
+        `${selected.language || "unknown"}|${episodeUrl}`;
+
+    if (
+        processedEpisodeUrls.has(
             episodeKey
+        )
+    ) {
+
+        return [];
+    }
+
+    processedEpisodeUrls.add(
+        episodeKey
+    );
+
+    // ==============================================
+    // EPISODE HTML
+    // ==============================================
+
+    const episodeHtml =
+        await fetchText(
+            episodeUrl
         );
 
-        // ==============================================
-        // EPISODE HTML
-        // ==============================================
+    console.log(
+        `[Latanime] Episode HTML length: ${episodeHtml.length}`
+    );
 
-        const episodeHtml =
-            await fetchText(
-                episodeUrl
+    // ==============================================
+    // SERVERS
+    // ==============================================
+
+    const servers =
+        extractServers(
+            episodeHtml,
+            episodeUrl
+        );
+
+    console.log(
+        `[Latanime] Servers found for ${languageLabel(selected.language)}: ${servers.length}`
+    );
+
+    // ==============================================
+    // RESOLVE (EN PARALELO)
+    // ==============================================
+
+    const language =
+        languageLabel(
+            selected.language
+        );
+
+    const resolved =
+        await Promise.all(
+            servers.map(
+                server =>
+                    resolveServer(
+                        server,
+                        language
+                    )
+            )
+        );
+
+    return resolved.filter(
+        Boolean
+    );
+}
+
+
+// ======================================================
+// RESOLVE ONE SERVER
+// ======================================================
+
+async function resolveServer(
+    server,
+    language
+) {
+
+    console.log(
+        `[Latanime] Processing server: ${server.name} (${language})`
+    );
+
+    let resolver =
+        getResolver(
+            server.name
+        );
+
+    // ==============================================
+    // FALLBACK: IDENTIFY SERVER BY URL
+    // ==============================================
+
+    if (
+        !resolver
+    ) {
+
+        resolver =
+            getResolverByUrl(
+                server.url
             );
 
-        console.log(
-            `[Latanime] Episode HTML length: ${episodeHtml.length}`
-        );
-
-        // ==============================================
-        // SERVERS
-        // ==============================================
-
-        const servers =
-            extractServers(
-                episodeHtml,
-                episodeUrl
-            );
-
-        console.log(
-            `[Latanime] Servers found for ${languageLabel(selected.language)}: ${servers.length}`
-        );
-
-        // ==============================================
-        // RESOLVE
-        // ==============================================
-
-        for (
-            const server of servers
+        if (
+            resolver
         ) {
 
             console.log(
-                `[Latanime] Processing server: ${server.name} (${languageLabel(selected.language)})`
+                `[Latanime] Resolver found by URL for: ${server.name}`
             );
-
-            let resolver =
-                getResolver(
-                    server.name
-                );
-
-            // ==========================================
-            // FALLBACK: IDENTIFY SERVER BY URL
-            // ==========================================
-
-            if (
-                !resolver
-            ) {
-
-                resolver =
-                    getResolverByUrl(
-                        server.url
-                    );
-
-                if (
-                    resolver
-                ) {
-
-                    console.log(
-                        `[Latanime] Resolver found by URL for: ${server.name}`
-                    );
-                }
-            }
-
-            if (
-                !resolver
-            ) {
-
-                console.log(
-                    `[Latanime] No resolver for: ${server.name}`
-                );
-
-                continue;
-            }
-
-            try {
-
-                const resolved =
-                    await resolver(
-                        server.url
-                    );
-
-                if (
-                    !resolved ||
-                    !resolved.url
-                ) {
-
-                    console.warn(
-                        `[Latanime] Resolver returned no stream: ${server.name}`
-                    );
-
-                    continue;
-                }
-
-                const quality =
-                    resolved.quality ||
-                    "HD";
-
-                const serverName =
-                    resolved.serverName ||
-                    server.name;
-
-                const language =
-                    languageLabel(
-                        selected.language
-                    );
-
-                const streamUrl =
-                    resolved.url;
-
-                // ==========================================
-                // STREAM DEDUPLICATION
-                // ==========================================
-
-                const duplicate =
-                    streams.some(
-                        stream =>
-                            stream.url ===
-                            streamUrl &&
-                            stream.title ===
-                            `${language} • ${serverName} • ${quality}`
-                    );
-
-                if (
-                    duplicate
-                ) {
-
-                    continue;
-                }
-
-                streams.push({
-
-                    name:
-                        `Latanime • ${language} • ${serverName}`,
-
-                    title:
-                        `${language} • ${serverName} • ${quality}`,
-
-                    quality,
-
-                    url:
-                        streamUrl,
-
-                    verified:
-                        resolved.verified === true,
-
-                    headers:
-                        resolved.headers ||
-                        {},
-
-                    behaviorHints:
-                        resolved.behaviorHints ||
-                        {
-                            notWebReady: false
-                        }
-                });
-
-                console.log(
-                    `[Latanime] Stream added: ${language} / ${serverName} / ${quality}`
-                );
-
-            } catch (
-                error
-            ) {
-
-                console.warn(
-                    `[Latanime] Resolver failed for ${server.name}: ${error.message}`
-                );
-            }
         }
     }
 
-    console.log(
-        `[Latanime] Final streams: ${streams.length}`
-    );
+    if (
+        !resolver
+    ) {
 
-    return streams;
+        console.log(
+            `[Latanime] No resolver (or disabled) for: ${server.name}`
+        );
+
+        return null;
+    }
+
+    try {
+
+        const resolved =
+            await resolver(
+                server.url
+            );
+
+        if (
+            !resolved ||
+            !resolved.url
+        ) {
+
+            console.warn(
+                `[Latanime] Resolver returned no stream: ${server.name}`
+            );
+
+            return null;
+        }
+
+        const quality =
+            resolved.quality ||
+            "HD";
+
+        const serverName =
+            resolved.serverName ||
+            server.name;
+
+        // Formato de salida (igual que AnimeAV1): name corto, title
+        // vacío y toda la información visible en quality.
+        const label =
+            `📺 ${serverName}\n${quality} | Anime\n${language}`;
+
+        console.log(
+            `[Latanime] Stream added: ${language} / ${serverName} / ${quality}`
+        );
+
+        return {
+
+            name:
+                "Latanime",
+
+            title:
+                "",
+
+            quality:
+                label,
+
+            url:
+                resolved.url,
+
+            verified:
+                resolved.verified === true,
+
+            headers:
+                resolved.headers ||
+                {},
+
+            behaviorHints:
+                resolved.behaviorHints ||
+                {
+                    notWebReady: false
+                },
+
+            // Campo interno solo para ordenar; se elimina antes de devolver.
+            serverName
+        };
+
+    } catch (
+        error
+    ) {
+
+        console.warn(
+            `[Latanime] Resolver failed for ${server.name}: ${error.message}`
+        );
+
+        return null;
+    }
 }
 
 
