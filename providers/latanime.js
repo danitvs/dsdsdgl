@@ -1,6 +1,6 @@
 /**
  * latanime - Built from src/latanime/
- * Generated: 2026-08-28T01:10:24.703Z
+ * Generated: 2026-09-30T06:34:34.424Z
  */
 var __create = Object.create;
 var __defProp = Object.defineProperty;
@@ -25,6 +25,18 @@ var __spreadValues = (a, b) => {
   return a;
 };
 var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
+var __objRest = (source, exclude) => {
+  var target = {};
+  for (var prop in source)
+    if (__hasOwnProp.call(source, prop) && exclude.indexOf(prop) < 0)
+      target[prop] = source[prop];
+  if (source != null && __getOwnPropSymbols)
+    for (var prop of __getOwnPropSymbols(source)) {
+      if (exclude.indexOf(prop) < 0 && __propIsEnum.call(source, prop))
+        target[prop] = source[prop];
+    }
+  return target;
+};
 var __copyProps = (to, from, except, desc) => {
   if (from && typeof from === "object" || typeof from === "function") {
     for (let key of __getOwnPropNames(from))
@@ -858,18 +870,38 @@ function normalizeVideoUrl(value) {
 }
 
 // src/latanime/resolvers/index.js
-function getResolver(serverName) {
+var ENABLED_SOURCES = {
+  MP4Upload: true,
+  Hexload: true,
+  Mixdrop: true
+};
+var SOURCE_ORDER = [
+  "MP4Upload",
+  "Hexload",
+  "Mixdrop"
+];
+var RESOLVERS = {
+  MP4Upload: resolveMp4Upload,
+  Hexload: resolveHexload,
+  Mixdrop: resolveMixdrop
+};
+function findSourceKey(serverName) {
   const name = String(serverName || "").toLowerCase().trim();
-  if (name.includes("mp4upload")) {
-    return resolveMp4Upload;
+  return Object.keys(RESOLVERS).find(
+    (key) => name.includes(key.toLowerCase())
+  ) || null;
+}
+function getResolver(serverName) {
+  const key = findSourceKey(serverName);
+  if (!key || !ENABLED_SOURCES[key]) {
+    return null;
   }
-  if (name.includes("hexload")) {
-    return resolveHexload;
-  }
-  if (name.includes("mixdrop")) {
-    return resolveMixdrop;
-  }
-  return null;
+  return RESOLVERS[key];
+}
+function sourceRank(serverName) {
+  const key = findSourceKey(serverName);
+  const index = key ? SOURCE_ORDER.indexOf(key) : -1;
+  return index === -1 ? SOURCE_ORDER.length : index;
 }
 
 // src/latanime/extractor.js
@@ -900,7 +932,7 @@ function extractStreams(tmdbId, mediaType, season, episode) {
       results,
       media,
       mediaType === "tv" ? season : null
-    );
+    ).filter(Boolean);
     if (selectedResults.length === 0) {
       console.log(
         "[Latanime] No matching result found."
@@ -911,9 +943,6 @@ function extractStreams(tmdbId, mediaType, season, episode) {
       `[Latanime] Selected results: ${selectedResults.length}`
     );
     for (const selected of selectedResults) {
-      if (!selected) {
-        continue;
-      }
       console.log(
         `[Latanime] Selected: ${selected.title}`
       );
@@ -924,130 +953,186 @@ function extractStreams(tmdbId, mediaType, season, episode) {
         `[Latanime] URL: ${selected.url}`
       );
     }
-    const streams = [];
+    if (mediaType === "tv" && (!Number.isInteger(Number(season)) || !Number.isInteger(Number(episode)))) {
+      throw new Error(
+        "[Latanime] A TV request requires season and episode numbers."
+      );
+    }
     const processedEpisodeUrls = /* @__PURE__ */ new Set();
-    for (const selected of selectedResults) {
-      if (!selected) {
-        continue;
-      }
-      let episodeUrl = selected.url;
-      if (mediaType === "tv") {
-        if (!Number.isInteger(
-          Number(season)
-        ) || !Number.isInteger(
-          Number(episode)
-        )) {
-          throw new Error(
-            "[Latanime] A TV request requires season and episode numbers."
-          );
-        }
-        episodeUrl = yield getEpisodeUrl(
-          selected.url,
+    const perVariant = yield Promise.all(
+      selectedResults.map(
+        (selected) => processVariant(
+          selected,
+          mediaType,
           season,
-          episode
-        );
-        if (!episodeUrl) {
-          console.warn(
-            `[Latanime] Episode S${season}E${episode} not found for ${selected.language || "unknown"}`
-          );
-          continue;
-        }
-        console.log(
-          `[Latanime] ${languageLabel(selected.language)} episode URL: ${episodeUrl}`
-        );
-      }
-      const episodeKey = `${selected.language || "unknown"}|${episodeUrl}`;
-      if (processedEpisodeUrls.has(
-        episodeKey
+          episode,
+          processedEpisodeUrls
+        ).catch(
+          (error) => {
+            console.warn(
+              `[Latanime] Variant failed (${selected.language || "unknown"}): ${error.message}`
+            );
+            return [];
+          }
+        )
+      )
+    );
+    const streams = [];
+    const seenStreams = /* @__PURE__ */ new Set();
+    for (const stream of perVariant.flat()) {
+      const key = `${stream.url}|${stream.quality}`;
+      if (seenStreams.has(
+        key
       )) {
         continue;
       }
-      processedEpisodeUrls.add(
-        episodeKey
+      seenStreams.add(
+        key
       );
-      const episodeHtml = yield fetchText(
-        episodeUrl
+      streams.push(
+        stream
       );
+    }
+    const ordered = streams.map(
+      (stream, index) => ({
+        stream,
+        index,
+        rank: sourceRank(
+          stream.serverName
+        )
+      })
+    ).sort(
+      (a, b) => a.rank - b.rank || a.index - b.index
+    ).map(
+      (item) => {
+        const _a = item.stream, { serverName } = _a, stream = __objRest(_a, ["serverName"]);
+        return stream;
+      }
+    );
+    console.log(
+      `[Latanime] Final streams: ${ordered.length}`
+    );
+    return ordered;
+  });
+}
+function processVariant(selected, mediaType, season, episode, processedEpisodeUrls) {
+  return __async(this, null, function* () {
+    let episodeUrl = selected.url;
+    if (mediaType === "tv") {
+      episodeUrl = yield getEpisodeUrl(
+        selected.url,
+        season,
+        episode
+      );
+      if (!episodeUrl) {
+        console.warn(
+          `[Latanime] Episode S${season}E${episode} not found for ${selected.language || "unknown"}`
+        );
+        return [];
+      }
       console.log(
-        `[Latanime] Episode HTML length: ${episodeHtml.length}`
+        `[Latanime] ${languageLabel(selected.language)} episode URL: ${episodeUrl}`
       );
-      const servers = extractServers(
-        episodeHtml,
-        episodeUrl
+    }
+    const episodeKey = `${selected.language || "unknown"}|${episodeUrl}`;
+    if (processedEpisodeUrls.has(
+      episodeKey
+    )) {
+      return [];
+    }
+    processedEpisodeUrls.add(
+      episodeKey
+    );
+    const episodeHtml = yield fetchText(
+      episodeUrl
+    );
+    console.log(
+      `[Latanime] Episode HTML length: ${episodeHtml.length}`
+    );
+    const servers = extractServers(
+      episodeHtml,
+      episodeUrl
+    );
+    console.log(
+      `[Latanime] Servers found for ${languageLabel(selected.language)}: ${servers.length}`
+    );
+    const language = languageLabel(
+      selected.language
+    );
+    const resolved = yield Promise.all(
+      servers.map(
+        (server) => resolveServer(
+          server,
+          language
+        )
+      )
+    );
+    return resolved.filter(
+      Boolean
+    );
+  });
+}
+function resolveServer(server, language) {
+  return __async(this, null, function* () {
+    console.log(
+      `[Latanime] Processing server: ${server.name} (${language})`
+    );
+    let resolver = getResolver(
+      server.name
+    );
+    if (!resolver) {
+      resolver = getResolverByUrl(
+        server.url
       );
-      console.log(
-        `[Latanime] Servers found for ${languageLabel(selected.language)}: ${servers.length}`
-      );
-      for (const server of servers) {
+      if (resolver) {
         console.log(
-          `[Latanime] Processing server: ${server.name} (${languageLabel(selected.language)})`
+          `[Latanime] Resolver found by URL for: ${server.name}`
         );
-        let resolver = getResolver(
-          server.name
-        );
-        if (!resolver) {
-          resolver = getResolverByUrl(
-            server.url
-          );
-          if (resolver) {
-            console.log(
-              `[Latanime] Resolver found by URL for: ${server.name}`
-            );
-          }
-        }
-        if (!resolver) {
-          console.log(
-            `[Latanime] No resolver for: ${server.name}`
-          );
-          continue;
-        }
-        try {
-          const resolved = yield resolver(
-            server.url
-          );
-          if (!resolved || !resolved.url) {
-            console.warn(
-              `[Latanime] Resolver returned no stream: ${server.name}`
-            );
-            continue;
-          }
-          const quality = resolved.quality || "HD";
-          const serverName = resolved.serverName || server.name;
-          const language = languageLabel(
-            selected.language
-          );
-          const streamUrl = resolved.url;
-          const duplicate = streams.some(
-            (stream) => stream.url === streamUrl && stream.title === `${language} \u2022 ${serverName} \u2022 ${quality}`
-          );
-          if (duplicate) {
-            continue;
-          }
-          streams.push({
-            name: `Latanime \u2022 ${language} \u2022 ${serverName}`,
-            title: `${language} \u2022 ${serverName} \u2022 ${quality}`,
-            quality,
-            url: streamUrl,
-            verified: resolved.verified === true,
-            headers: resolved.headers || {},
-            behaviorHints: resolved.behaviorHints || {
-              notWebReady: false
-            }
-          });
-          console.log(
-            `[Latanime] Stream added: ${language} / ${serverName} / ${quality}`
-          );
-        } catch (error) {
-          console.warn(
-            `[Latanime] Resolver failed for ${server.name}: ${error.message}`
-          );
-        }
       }
     }
-    console.log(
-      `[Latanime] Final streams: ${streams.length}`
-    );
-    return streams;
+    if (!resolver) {
+      console.log(
+        `[Latanime] No resolver (or disabled) for: ${server.name}`
+      );
+      return null;
+    }
+    try {
+      const resolved = yield resolver(
+        server.url
+      );
+      if (!resolved || !resolved.url) {
+        console.warn(
+          `[Latanime] Resolver returned no stream: ${server.name}`
+        );
+        return null;
+      }
+      const quality = resolved.quality || "HD";
+      const serverName = resolved.serverName || server.name;
+      const label = `\u{1F4FA} ${serverName}
+${quality} | Anime
+${language}`;
+      console.log(
+        `[Latanime] Stream added: ${language} / ${serverName} / ${quality}`
+      );
+      return {
+        name: "Latanime",
+        title: "",
+        quality: label,
+        url: resolved.url,
+        verified: resolved.verified === true,
+        headers: resolved.headers || {},
+        behaviorHints: resolved.behaviorHints || {
+          notWebReady: false
+        },
+        // Campo interno solo para ordenar; se elimina antes de devolver.
+        serverName
+      };
+    } catch (error) {
+      console.warn(
+        `[Latanime] Resolver failed for ${server.name}: ${error.message}`
+      );
+      return null;
+    }
   });
 }
 function extractServers(html, pageUrl) {
