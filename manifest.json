@@ -1,21 +1,21 @@
 {
-  "name": "dani2",
-  "version": "1.0.1",
-  "description": "Proveedores para Nuvio.",
+  "name": "jdkdjs",
+  "version": "1.0.2",
+  "description": ".",
   "scrapers": [
     {
-      "id": "latanime",
-      "name": "Latanime",
-      "description": "Películas y series de anime desde Latanime.",
+      "id": "lajdhjsj",
+      "name": "lajdhjsj",
+      "description": ".",
       "version": "1.0.1",
-      "author": "D3PR3D4D0R",
+      "author": "jsns",
       "supportedTypes": [
         "movie",
         "tv"
       ],
-      "filename": "providers/latanime.js",
+      "filename": "providers/lajdhjsj.js",
       "enabled": true,
-      "logo": "https://latanime.org/img/logito.png",
+      "logo": "",
       "contentLanguage": [
         "es",
         "lat"
