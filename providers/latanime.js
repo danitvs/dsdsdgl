@@ -287,6 +287,19 @@ function searchLatanime(query) {
             break;
           }
         }
+        if (season === null) {
+          const cleanForSeason = cleanResultTitle(title);
+          const ordinal = cleanForSeason.match(/(\d{1,2})(?:st|nd|rd|th)\s+season/i);
+          const roman = cleanForSeason.match(/\s(II|III|IV|V|VI|VII|VIII|IX)(?=\s*$|\s*:|\s+part\b)/);
+          const trailing = cleanForSeason.match(/\s([2-9])\s*$/);
+          if (ordinal) {
+            season = Number(ordinal[1]);
+          } else if (roman) {
+            season = { II: 2, III: 3, IV: 4, V: 5, VI: 6, VII: 7, VIII: 8, IX: 9 }[roman[1]];
+          } else if (trailing) {
+            season = Number(trailing[1]);
+          }
+        }
         let year = null;
         const yearMatch = fullText.match(
           /\b(19|20)\d{2}\b/
@@ -385,8 +398,8 @@ function getEpisodeUrl(seriesUrl, season, episode) {
         const expectedEpisode = `-episodio-${targetEpisode}`;
         if (hrefLower.includes(
           "/ver/"
-        ) && hrefLower.includes(
-          expectedEpisode
+        ) && new RegExp(expectedEpisode + "(?!\\d)").test(
+          hrefLower
         )) {
           episodeUrl = fullUrl;
           console.log(
@@ -870,20 +883,122 @@ function normalizeVideoUrl(value) {
 }
 
 // src/latanime/resolvers/index.js
+// src/latanime/resolvers/voe.js
+var VOE_MARKERS = ["@$", "^^", "~@", "%?", "*~", "!!", "#&"];
+function voeRot13(str) {
+  return str.replace(/[a-zA-Z]/g, (char) => {
+    const code = char.charCodeAt(0);
+    const base = code <= 90 ? 65 : 97;
+    return String.fromCharCode((code - base + 13) % 26 + base);
+  });
+}
+function decodeVoePayload(rawValue) {
+  let x = voeRot13(rawValue);
+  for (const marker of VOE_MARKERS) {
+    x = x.split(marker).join("_");
+  }
+  x = x.split("_").join("");
+  x = atob(x);
+  x = Array.from(x).map((c) => String.fromCharCode((c.charCodeAt(0) - 3 + 256) % 256)).join("");
+  x = x.split("").reverse().join("");
+  x = atob(x);
+  return JSON.parse(x);
+}
+function resolveVoe(embedUrl) {
+  return __async(this, null, function* () {
+    try {
+      console.log(`[Voe] Resolving: ${embedUrl}`);
+      const fetchHtml = (url) => __async(this, null, function* () {
+        const resp = yield fetch(url, {
+          headers: { "User-Agent": HEADERS["User-Agent"], "Referer": "https://latanime.org/" }
+        });
+        if (!resp.ok) {
+          throw new Error(`HTTP ${resp.status} en ${url}`);
+        }
+        return { html: yield resp.text(), url: resp.url || url };
+      });
+      let page = yield fetchHtml(embedUrl);
+      // fetch() no ejecuta JavaScript: se sigue a mano la redireccion window.location.href de VOE
+      const jsRedirect = page.html.match(/window\.location\.href\s*=\s*['"]([^'"]+)['"]/);
+      if (jsRedirect) {
+        console.log(`[Voe] Redireccion JS: ${jsRedirect[1]}`);
+        page = yield fetchHtml(jsRedirect[1]);
+      }
+      const scriptMatch = page.html.match(/<script type="application\/json"[^>]*>([\s\S]*?)<\/script>/);
+      if (!scriptMatch) {
+        console.warn("[Voe] No se encontro el <script type=\"application/json\"> en el embed.");
+        return null;
+      }
+      const jsonText = scriptMatch[1].trim().replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#34;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">");
+      const payloadArray = JSON.parse(jsonText);
+      if (!Array.isArray(payloadArray) || !payloadArray[0]) {
+        console.warn("[Voe] Payload inesperado.");
+        return null;
+      }
+      const decoded = decodeVoePayload(payloadArray[0]);
+      let origin;
+      try {
+        origin = new URL(page.url).origin;
+      } catch (e) {
+        origin = new URL(embedUrl).origin;
+      }
+      const variants = [];
+      if (decoded.source) {
+        variants.push({
+          url: decoded.source,
+          quality: "HD \u00B7 HLS",
+          serverName: "Voe",
+          verified: false,
+          headers: {
+            "Referer": `${origin}/`,
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Dest": "empty",
+            "User-Agent": HEADERS["User-Agent"]
+          },
+          behaviorHints: { notWebReady: false }
+        });
+      }
+      const mp4 = decoded.fallback && decoded.fallback[0] && decoded.fallback[0].file;
+      if (mp4) {
+        variants.push({
+          url: mp4,
+          quality: "HD \u00B7 MP4",
+          serverName: "Voe",
+          verified: false,
+          headers: { "User-Agent": HEADERS["User-Agent"] },
+          behaviorHints: { notWebReady: false }
+        });
+      }
+      if (variants.length === 0) {
+        console.warn("[Voe] El payload no trajo ni source ni fallback.");
+        return null;
+      }
+      console.log(`[Voe] ${variants.length} variante(s)`);
+      return variants;
+    } catch (error) {
+      console.error(`[Voe] Error: ${error.message}`);
+      return null;
+    }
+  });
+}
 var ENABLED_SOURCES = {
   MP4Upload: true,
   Hexload: true,
-  Mixdrop: true
+  Mixdrop: true,
+  Voe: true
 };
 var SOURCE_ORDER = [
   "MP4Upload",
   "Hexload",
-  "Mixdrop"
+  "Mixdrop",
+  "Voe"
 ];
 var RESOLVERS = {
   MP4Upload: resolveMp4Upload,
   Hexload: resolveHexload,
-  Mixdrop: resolveMixdrop
+  Mixdrop: resolveMixdrop,
+  Voe: resolveVoe
 };
 function findSourceKey(serverName) {
   const name = String(serverName || "").toLowerCase().trim();
@@ -1067,7 +1182,7 @@ function processVariant(selected, mediaType, season, episode, processedEpisodeUr
         )
       )
     );
-    return resolved.filter(
+    return resolved.flat().filter(
       Boolean
     );
   });
@@ -1097,36 +1212,43 @@ function resolveServer(server, language) {
       return null;
     }
     try {
-      const resolved = yield resolver(
+      const resolvedRaw = yield resolver(
         server.url
       );
-      if (!resolved || !resolved.url) {
+      const resolvedList = (Array.isArray(resolvedRaw) ? resolvedRaw : [resolvedRaw]).filter(
+        (item) => item && item.url
+      );
+      if (resolvedList.length === 0) {
         console.warn(
           `[Latanime] Resolver returned no stream: ${server.name}`
         );
         return null;
       }
-      const quality = resolved.quality || "HD";
-      const serverName = resolved.serverName || server.name;
-      const label = `\u{1F4FA} ${serverName}
+      return resolvedList.map(
+        (resolved) => {
+          const quality = resolved.quality || "HD";
+          const serverName = resolved.serverName || server.name;
+          const label = `\u{1F4FA} ${serverName}
 ${quality} | Anime
 ${language}`;
-      console.log(
-        `[Latanime] Stream added: ${language} / ${serverName} / ${quality}`
+          console.log(
+            `[Latanime] Stream added: ${language} / ${serverName} / ${quality}`
+          );
+          return {
+            name: "Latanime",
+            title: "",
+            quality: label,
+            url: resolved.url,
+            verified: resolved.verified === true,
+            headers: resolved.headers || {},
+            behaviorHints: resolved.behaviorHints || {
+              notWebReady: false
+            },
+            // Campo interno solo para ordenar; se elimina antes de devolver.
+            serverName
+          };
+        }
       );
-      return {
-        name: "Latanime",
-        title: "",
-        quality: label,
-        url: resolved.url,
-        verified: resolved.verified === true,
-        headers: resolved.headers || {},
-        behaviorHints: resolved.behaviorHints || {
-          notWebReady: false
-        },
-        // Campo interno solo para ordenar; se elimina antes de devolver.
-        serverName
-      };
     } catch (error) {
       console.warn(
         `[Latanime] Resolver failed for ${server.name}: ${error.message}`
@@ -1531,16 +1653,50 @@ function expandSearchTitles(titles) {
   }
   return result;
 }
+var MIN_TITLE_SIMILARITY = 0.72;
+var TITLE_STOP_WORDS = ["the", "a", "an", "of", "and", "no", "wa", "wo", "ni", "to", "ga", "de", "la", "el", "los", "las", "y", "en", "del"];
+function stripSeasonMarkers(title) {
+  return String(title || "").replace(/\b(?:latino|castellano|subtitulado|sub|dub|doblado)\b/gi, " ").replace(/\b\d{1,2}(?:st|nd|rd|th)\s+season\b/gi, " ").replace(/\bseason\s*\d{1,2}\b/gi, " ").replace(/\btemporada\s*\d{1,2}\b/gi, " ").replace(/\bpart\s*\d{1,2}\b/gi, " ").replace(/\bS\d{1,2}\b/gi, " ").replace(/\s+(?:II|III|IV|V|VI|VII|VIII|IX)(?=\s*$|\s*:)/g, " ").replace(/\s+[2-9]\s*$/g, " ").replace(/\s+/g, " ").trim();
+}
+function titleTokens(title) {
+  const seen = {};
+  const out = [];
+  normalizeTitle(stripSeasonMarkers(title)).split(" ").forEach((word) => {
+    if (word && TITLE_STOP_WORDS.indexOf(word) === -1 && !seen[word]) {
+      seen[word] = true;
+      out.push(word);
+    }
+  });
+  return out;
+}
+function titleSimilarity(a, b) {
+  const A = titleTokens(a);
+  const B = titleTokens(b);
+  if (A.length === 0 || B.length === 0) {
+    return 0;
+  }
+  if (A.join("") === B.join("")) {
+    return 1;
+  }
+  const setB = {};
+  B.forEach((w) => {
+    setB[w] = true;
+  });
+  const inter = A.filter((w) => setB[w]).length;
+  let sim = 2 * inter / (A.length + B.length);
+  const shortLen = Math.min(A.length, B.length);
+  if (inter === shortLen && shortLen >= 3) {
+    sim = Math.max(sim, 0.75);
+  }
+  return sim;
+}
 function selectResults(results, media, requestedSeason) {
   let candidates = results;
-  if (requestedSeason !== null && requestedSeason !== void 0) {
-    const targetSeason = Number(
-      requestedSeason
-    );
+  const isTv = requestedSeason !== null && requestedSeason !== void 0;
+  const targetSeason = isTv ? Number(requestedSeason) : null;
+  if (isTv) {
     const seasonResults = candidates.filter(
-      (result) => Number(
-        result.season
-      ) === targetSeason
+      (result) => Number(result.season) === targetSeason
     );
     const unknownSeasonResults = candidates.filter(
       (result) => result.season === null || result.season === void 0
@@ -1550,7 +1706,7 @@ function selectResults(results, media, requestedSeason) {
       console.log(
         `[Latanime] Season filter S${targetSeason}: ${seasonResults.length} result(s)`
       );
-    } else if (unknownSeasonResults.length > 0) {
+    } else if (targetSeason <= 1 && unknownSeasonResults.length > 0) {
       candidates = unknownSeasonResults;
       console.log(
         `[Latanime] No explicit S${targetSeason} result found; using ${unknownSeasonResults.length} result(s) with unknown season.`
@@ -1563,147 +1719,71 @@ function selectResults(results, media, requestedSeason) {
     }
   }
   const mainResults = candidates.filter(
-    (result) => !isStrongAuxiliaryResult(
-      result
-    )
+    (result) => !isStrongAuxiliaryResult(result)
   );
   if (mainResults.length > 0) {
     candidates = mainResults;
   }
   const titles = [];
-  addTitle(
-    titles,
-    media.title
-  );
-  addTitle(
-    titles,
-    media.originalTitle
-  );
-  if (Array.isArray(
-    media.alternativeTitles
-  )) {
+  addTitle(titles, media.title);
+  addTitle(titles, media.originalTitle);
+  if (Array.isArray(media.alternativeTitles)) {
     for (const title of media.alternativeTitles) {
-      addTitle(
-        titles,
-        title
-      );
+      addTitle(titles, title);
     }
   }
-  const normalizedTitles = titles.map(
-    normalizeTitle
-  );
-  const scored = candidates.map(
-    (result) => {
-      const cleanTitle = cleanResultTitle(
-        result.title
-      );
-      const normalizedResult = normalizeTitle(
-        cleanTitle
-      );
-      let score = 0;
-      if (normalizedTitles.includes(
-        normalizedResult
-      )) {
-        score += 100;
+  const useYear = media.year && (!isTv || targetSeason <= 1);
+  const scored = candidates.map((result) => {
+    const cleanTitle = cleanResultTitle(result.title);
+    let sim = 0;
+    for (const title of titles) {
+      const s = titleSimilarity(cleanTitle, title);
+      if (s > sim) {
+        sim = s;
       }
-      for (const title of normalizedTitles) {
-        if (!title) {
-          continue;
-        }
-        if (normalizedResult.includes(
-          title
-        ) || title.includes(
-          normalizedResult
-        )) {
-          score += 50;
-        }
-        const resultWords = new Set(
-          normalizedResult.split(
-            " "
-          )
-        );
-        const titleWords = title.split(
-          " "
-        );
-        for (const word of titleWords) {
-          if (word.length >= 3 && resultWords.has(
-            word
-          )) {
-            score += 5;
-          }
-        }
-      }
-      if (media.year && result.year && Number(
-        media.year
-      ) === Number(
-        result.year
-      )) {
-        score += 25;
-      }
-      if (result.language === "latino") {
-        score += 10;
-      } else if (result.language === "castellano") {
-        score += 5;
-      }
-      if (isSpecialVariant(
-        result
-      )) {
-        score -= 20;
-      } else {
-        score += 10;
-      }
-      return {
-        result,
-        score
-      };
     }
-  );
-  const latino = scored.filter(
-    (item) => normalizeLanguage(
-      item.result.language
-    ) === "latino"
-  ).sort(
-    (a, b) => b.score - a.score
-  );
-  const castellano = scored.filter(
-    (item) => normalizeLanguage(
-      item.result.language
-    ) === "castellano"
-  ).sort(
-    (a, b) => b.score - a.score
-  );
-  const unknown = scored.filter(
-    (item) => !normalizeLanguage(
-      item.result.language
-    )
-  ).sort(
-    (a, b) => b.score - a.score
-  );
+    let score = sim * 100;
+    if (useYear && result.year) {
+      const diff = Math.abs(Number(media.year) - Number(result.year));
+      if (diff === 0) {
+        score += 15;
+      } else if (diff > 1) {
+        score -= 15;
+      }
+    }
+    if (result.language === "latino") {
+      score += 2;
+    } else if (result.language === "castellano") {
+      score += 1;
+    }
+    score += isSpecialVariant(result) ? -20 : 5;
+    return { result, score, sim };
+  });
+  const confident = scored.filter((item) => item.sim >= MIN_TITLE_SIMILARITY);
+  if (confident.length === 0) {
+    const best = scored.slice().sort((a, b) => b.sim - a.sim)[0];
+    console.log(
+      `[Latanime] Sin coincidencia segura (mejor: "${best ? best.result.title : "-"}" sim=${best ? best.sim.toFixed(2) : 0}). No se devuelve nada para evitar un anime equivocado.`
+    );
+    return [];
+  }
+  const topSim = Math.max.apply(null, confident.map((item) => item.sim));
+  const pool = confident.filter((item) => item.sim >= topSim - 0.15);
+  const byScore = (a, b) => b.score - a.score;
+  const latino = pool.filter((item) => normalizeLanguage(item.result.language) === "latino").sort(byScore);
+  const castellano = pool.filter((item) => normalizeLanguage(item.result.language) === "castellano").sort(byScore);
+  const unknown = pool.filter((item) => !normalizeLanguage(item.result.language)).sort(byScore);
   const selected = [];
   if (latino.length > 0) {
-    selected.push(
-      selectBestLanguageResult(
-        latino
-      )
-    );
+    selected.push(selectBestLanguageResult(latino));
   }
   if (castellano.length > 0) {
-    selected.push(
-      selectBestLanguageResult(
-        castellano
-      )
-    );
+    selected.push(selectBestLanguageResult(castellano));
   }
   if (selected.length === 0 && unknown.length > 0) {
-    selected.push(
-      selectBestLanguageResult(
-        unknown
-      )
-    );
+    selected.push(selectBestLanguageResult(unknown));
   }
-  console.log(
-    "[Latanime] Resultados seleccionados:"
-  );
+  console.log("[Latanime] Resultados seleccionados:");
   for (const result of selected) {
     if (!result) {
       continue;
@@ -1712,9 +1792,7 @@ function selectResults(results, media, requestedSeason) {
       `  ${languageLabel(result.language)} \u2192 ${result.title} \u2192 ${result.url}`
     );
   }
-  return selected.filter(
-    Boolean
-  );
+  return selected.filter(Boolean);
 }
 function selectBestLanguageResult(scoredResults) {
   if (scoredResults.length === 0) {
